@@ -25,6 +25,7 @@ import {
   Settings,
   Star,
   Sun,
+  Trash2,
   Users,
   Utensils,
   X,
@@ -49,6 +50,7 @@ import {
   TRIP_DOCUMENT_STORAGE_KEY,
   VIEWER_PROFILE_STORAGE_KEY,
   clearLegacyTripStorage,
+  createInitialTripDocument,
   getInitialTripDocument,
   getLinkedEntities,
   getLocationForEntity,
@@ -79,6 +81,7 @@ function cn(...inputs) {
 }
 
 const PAGE_ICONS = {
+  ops: Settings,
   itinerary: LayoutGrid,
   stay: Home,
   meals: Utensils,
@@ -86,6 +89,19 @@ const PAGE_ICONS = {
   expenses: Receipt,
   families: Users,
 }
+
+const OPS_STORAGE_KEY = 'trip-command-center/operations/v1'
+const OPS_COLLECTION_CONFIG = [
+  { key: 'families', label: 'Families', type: 'family' },
+  { key: 'locations', label: 'Locations / Stops', type: 'location' },
+  { key: 'routes', label: 'Routes', type: 'route' },
+  { key: 'itineraryItems', label: 'Itinerary Items', type: 'itineraryItem' },
+  { key: 'meals', label: 'Meals', type: 'meal' },
+  { key: 'activities', label: 'Activities', type: 'activity' },
+  { key: 'stayItems', label: 'Stay / Rooming', type: 'stayItem' },
+  { key: 'expenses', label: 'Expenses', type: 'expense' },
+  { key: 'tasks', label: 'Tasks', type: 'task' },
+]
 
 const WEATHER_ICONS = {
   sun: Sun,
@@ -124,6 +140,25 @@ const EXPENSE_SPLIT_LABELS = {
   individual: 'Individual',
 }
 
+const DESTINATION_TYPE_OPTIONS = [
+  { value: 'basecamp', label: 'Basecamp / house' },
+  { value: 'hotel', label: 'Hotel / resort' },
+  { value: 'park', label: 'Park / region' },
+  { value: 'city', label: 'City / district' },
+  { value: 'custom', label: 'Custom destination' },
+]
+
+const STOP_TYPE_OPTIONS = [
+  { value: 'stop', label: 'Stop' },
+  { value: 'meal', label: 'Lunch / meal' },
+  { value: 'poi', label: 'Point of interest' },
+]
+
+const FAMILY_WIZARD_DAY_OPTIONS = [
+  { id: 'travel', label: 'Travel day' },
+  ...DAYS.map((day) => ({ id: day.id, label: day.title })),
+]
+
 const PLAYBACK_SPEED_OPTIONS = [1, 2, 3, 4]
 const TIMELINE_HOURS_PER_SLOT = 6
 const TIMELINE_HOUR_STEPS = 24
@@ -140,6 +175,34 @@ const MISSION_FEED_FADE_MS = 500
 const MISSION_FEED_TICK_MS = 100
 const PLAYBACK_MAX_FRAME_DELTA_SECONDS = 0.18
 const PLAYBACK_STALL_RESET_SECONDS = 0.6
+
+function slugify(value, fallback = 'item') {
+  return (value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    || fallback
+}
+
+function createFamilyStopDraft(type = 'stop') {
+  return {
+    title: '',
+    address: '',
+    note: '',
+    type,
+  }
+}
+
+function createScheduleDraft(dayId = 'travel') {
+  return {
+    dayId,
+    time: '',
+    title: '',
+    location: '',
+    note: '',
+    shareable: false,
+  }
+}
 
 const SEEDED_PLAN_REFRESH_IDS = {
   families: new Set(['north-star', 'silver-peak', 'desert-bloom']),
@@ -835,8 +898,101 @@ function AppShell({
   families,
   activeFamily,
   onSetActiveFamily,
+  operations,
+  activeOperationId,
+  onCreateOperation,
+  onSelectOperation,
+  onDeleteOperation,
+  onSaveOperationProfile,
+  onSaveFamilyPlan,
+  shareableActivities,
   children,
 }) {
+  const buildFamilyDraft = useCallback((family) => ({
+    familyId: family?.id || '',
+    familyName: family?.title || '',
+    origin: family?.origin || '',
+    headcount: family?.headcount || '1 adult',
+    departureDate: family?.departureDate || '',
+    departureTime: family?.departureTime || '',
+    departureLocation: family?.departureLocation || family?.origin || '',
+    arrivalEstimate: family?.eta || '',
+    lunchPlan: family?.lunchPlan || '',
+    notes: family?.note || '',
+    stops: Array.isArray(family?.travelStops) && family.travelStops.length
+      ? family.travelStops
+      : [createFamilyStopDraft('stop'), createFamilyStopDraft('meal')],
+    dailySchedule: Array.isArray(family?.dailySchedule) && family.dailySchedule.length
+      ? family.dailySchedule
+      : [createScheduleDraft('travel'), createScheduleDraft('fri'), createScheduleDraft('sat')],
+  }), [])
+  const [vacationWizardOpen, setVacationWizardOpen] = useState(false)
+  const [familyWizardOpen, setFamilyWizardOpen] = useState(false)
+  const [vacationStep, setVacationStep] = useState(0)
+  const [familyStep, setFamilyStep] = useState(0)
+  const [vacationDraft, setVacationDraft] = useState({
+    title: '',
+    commandName: 'Family Trip Command Center',
+    destinationType: 'basecamp',
+    destinationLabel: '',
+    destinationAddress: '',
+    destinationNotes: '',
+    startDate: '',
+    endDate: '',
+    summary: '',
+    trafficMode: 'none',
+  })
+  const [familyDraft, setFamilyDraft] = useState(buildFamilyDraft(activeFamily))
+  const [selectedSharedActivityIds, setSelectedSharedActivityIds] = useState([])
+
+  useEffect(() => {
+    setVacationDraft({
+      title: doc.operationProfile?.title || '',
+      commandName: doc.operationProfile?.commandName || 'Family Trip Command Center',
+      destinationType: doc.operationProfile?.destinationType || 'basecamp',
+      destinationLabel: doc.operationProfile?.destinationLabel || '',
+      destinationAddress: doc.operationProfile?.destinationAddress || '',
+      destinationNotes: doc.operationProfile?.destinationNotes || '',
+      startDate: doc.operationProfile?.startDate || '',
+      endDate: doc.operationProfile?.endDate || '',
+      summary: doc.operationProfile?.summary || '',
+      trafficMode: doc.operationProfile?.trafficMode || 'none',
+    })
+  }, [doc.operationProfile])
+
+  useEffect(() => {
+    setFamilyDraft(buildFamilyDraft(activeFamily))
+    setSelectedSharedActivityIds(activeFamily?.sharedActivityIds || [])
+  }, [activeFamily, buildFamilyDraft])
+
+  useEffect(() => {
+    if (!doc.operationProfile?.configuredAt) {
+      setVacationWizardOpen(true)
+      return
+    }
+    if (!activeFamily) {
+      setFamilyWizardOpen(true)
+    }
+  }, [activeFamily, doc.operationProfile?.configuredAt])
+
+  const shareableActivityOptions = shareableActivities.filter((activity) => activity.ownerFamilyId !== familyDraft.familyId)
+
+  const saveVacationWizard = () => {
+    if (!vacationDraft.title.trim() || !vacationDraft.destinationLabel.trim()) return
+    onSaveOperationProfile(vacationDraft)
+    setVacationWizardOpen(false)
+    setVacationStep(0)
+  }
+
+  const saveFamilyWizard = () => {
+    if (!familyDraft.familyName.trim()) return
+    const familyId = onSaveFamilyPlan(familyDraft, selectedSharedActivityIds)
+    if (!familyId) return
+    onSetActiveFamily(familyId)
+    setFamilyWizardOpen(false)
+    setFamilyStep(0)
+  }
+
   return (
     <div className="relative flex h-screen w-screen overflow-hidden bg-[#0d1117] font-sans text-[#C9D1D9] antialiased">
       <div className="flex w-16 flex-col border-r border-[#30363D] bg-[#0d1117]">
@@ -902,10 +1058,51 @@ function AppShell({
             </div>
             <div className="h-5 w-px bg-[#30363D]" />
             <div className="text-[10px] font-bold uppercase tracking-widest text-[#8B949E]">
-              {TRIP_META.commandName}
+              {doc.operationProfile?.commandName || TRIP_META.commandName}
             </div>
           </div>
           <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 border border-[#30363D] bg-[#0d1117] px-2 py-1">
+              <select
+                value={activeOperationId}
+                onChange={(event) => onSelectOperation(event.target.value)}
+                className="bg-transparent text-[10px] font-black uppercase tracking-[0.14em] text-[#C9D1D9] outline-none"
+              >
+                {operations.map((operation) => (
+                  <option key={operation.id} value={operation.id}>
+                    {operation.name}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={onCreateOperation}
+                className="border border-[#30363D] px-2 py-0.5 text-[9px] font-black uppercase tracking-wider text-[#58A6FF]"
+              >
+                New
+              </button>
+              <button
+                type="button"
+                onClick={onDeleteOperation}
+                className="border border-[#30363D] px-2 py-0.5 text-[9px] font-black uppercase tracking-wider text-[#F85149]"
+              >
+                Delete
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => setVacationWizardOpen(true)}
+              className="border border-[#30363D] bg-[#0d1117] px-2 py-1 text-[9px] font-black uppercase tracking-wider text-[#58A6FF]"
+            >
+              Create Operation
+            </button>
+            <button
+              type="button"
+              onClick={() => setFamilyWizardOpen(true)}
+              className="border border-[#30363D] bg-[#0d1117] px-2 py-1 text-[9px] font-black uppercase tracking-wider text-[#D29922]"
+            >
+              Family Plan
+            </button>
             <div className="flex items-center gap-2">
               <div className="text-[9px] font-black uppercase tracking-[0.18em] text-[#8B949E]">
                 Working as
@@ -926,6 +1123,11 @@ function AppShell({
                     {family.title}
                   </button>
                 ))}
+                {!families.length ? (
+                  <div className="text-[9px] font-black uppercase tracking-[0.14em] text-[#8B949E]">
+                    No families yet
+                  </div>
+                ) : null}
               </div>
             </div>
             <div className="rounded-[2px] border border-[#30363D] bg-[#0d1117] px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest text-[#58A6FF]">
@@ -971,24 +1173,274 @@ function AppShell({
         </div>
       </div>
 
-      {!activeFamily ? (
+      {vacationWizardOpen ? (
+        <div className="absolute inset-0 z-[55] flex items-center justify-center bg-[#0b0f14]/86 backdrop-blur-sm">
+          <div className="w-[840px] border border-[#30363D] bg-[#161b22] p-6 shadow-[0_24px_80px_rgba(0,0,0,0.45)]">
+            <div className="mb-5 flex items-start justify-between gap-4">
+              <div>
+                <div className="mb-2 text-[10px] font-black uppercase tracking-[0.22em] text-[#58A6FF]">Create Operation</div>
+                <div className="text-[20px] font-black uppercase tracking-[0.08em] text-[#E6EDF3]">Define the shared operation</div>
+                <div className="mt-2 max-w-[560px] text-[12px] leading-relaxed text-[#8B949E]">
+                  Define the overall operation once, then let each family build its own departures, stops, lunch plan, and shareable activities against the same destination.
+                </div>
+              </div>
+              {doc.operationProfile?.configuredAt ? (
+                <button
+                  type="button"
+                  onClick={() => setVacationWizardOpen(false)}
+                  className="border border-[#30363D] bg-[#0d1117] px-2 py-1 text-[10px] text-[#8B949E]"
+                >
+                  <X size={14} />
+                </button>
+              ) : null}
+            </div>
+            <div className="mb-5 grid grid-cols-4 gap-2">
+              {['Identity', 'Destination', 'Dates', 'Traffic'].map((label, index) => (
+                <button
+                  key={label}
+                  type="button"
+                  onClick={() => setVacationStep(index)}
+                  className={cn(
+                    'border px-3 py-2 text-left text-[10px] font-black uppercase tracking-[0.16em]',
+                    vacationStep === index
+                      ? 'border-[#58A6FF]/50 bg-[#58A6FF]/12 text-[#C9D1D9]'
+                      : 'border-[#30363D] bg-[#0d1117] text-[#8B949E]',
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {vacationStep === 0 ? (
+              <div className="grid gap-4 md:grid-cols-2">
+                <WizardField label="Vacation title" hint="This appears in the operation selector.">
+                  <WizardTextInput
+                    value={vacationDraft.title}
+                    onChange={(event) => setVacationDraft((current) => ({ ...current, title: event.target.value }))}
+                    placeholder="Yosemite Family Operation"
+                  />
+                </WizardField>
+                <WizardField label="Command label" hint="Compact command-center label for the header.">
+                  <WizardTextInput
+                    value={vacationDraft.commandName}
+                    onChange={(event) => setVacationDraft((current) => ({ ...current, commandName: event.target.value }))}
+                    placeholder="Family Trip Command Center"
+                  />
+                </WizardField>
+                <div className="md:col-span-2">
+                  <WizardField label="Shared summary">
+                    <WizardTextArea
+                      value={vacationDraft.summary}
+                      onChange={(event) => setVacationDraft((current) => ({ ...current, summary: event.target.value }))}
+                      placeholder="Describe the broad mission, coordination style, and how families should use the board."
+                    />
+                  </WizardField>
+                </div>
+              </div>
+            ) : null}
+            {vacationStep === 1 ? (
+              <div className="grid gap-4 md:grid-cols-2">
+                <WizardField label="Destination type">
+                  <select
+                    value={vacationDraft.destinationType}
+                    onChange={(event) => setVacationDraft((current) => ({ ...current, destinationType: event.target.value }))}
+                    className="border border-[#30363D] bg-[#0d1117] px-3 py-2 text-[11px] text-[#C9D1D9] outline-none focus:border-[#58A6FF]"
+                  >
+                    {DESTINATION_TYPE_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </WizardField>
+                <WizardField label="Destination label">
+                  <WizardTextInput
+                    value={vacationDraft.destinationLabel}
+                    onChange={(event) => setVacationDraft((current) => ({ ...current, destinationLabel: event.target.value }))}
+                    placeholder="Main house, resort, park basecamp"
+                  />
+                </WizardField>
+                <div className="md:col-span-2">
+                  <WizardField label="Destination address or region">
+                    <WizardTextInput
+                      value={vacationDraft.destinationAddress}
+                      onChange={(event) => setVacationDraft((current) => ({ ...current, destinationAddress: event.target.value }))}
+                      placeholder="Full address or broad region"
+                    />
+                  </WizardField>
+                </div>
+                <div className="md:col-span-2">
+                  <WizardField label="Destination notes">
+                    <WizardTextArea
+                      value={vacationDraft.destinationNotes}
+                      onChange={(event) => setVacationDraft((current) => ({ ...current, destinationNotes: event.target.value }))}
+                      placeholder="Parking, check-in window, gate details, or common arrival instructions"
+                    />
+                  </WizardField>
+                </div>
+              </div>
+            ) : null}
+            {vacationStep === 2 ? (
+              <div className="grid gap-4 md:grid-cols-2">
+                <WizardField label="Start date">
+                  <WizardTextInput
+                    type="date"
+                    value={vacationDraft.startDate}
+                    onChange={(event) => setVacationDraft((current) => ({ ...current, startDate: event.target.value }))}
+                  />
+                </WizardField>
+                <WizardField label="End date">
+                  <WizardTextInput
+                    type="date"
+                    value={vacationDraft.endDate}
+                    onChange={(event) => setVacationDraft((current) => ({ ...current, endDate: event.target.value }))}
+                  />
+                </WizardField>
+              </div>
+            ) : null}
+            {vacationStep === 3 ? (
+              <div className="grid gap-4">
+                <WizardField label="Traffic strategy">
+                  <select
+                    value={vacationDraft.trafficMode}
+                    onChange={(event) => setVacationDraft((current) => ({ ...current, trafficMode: event.target.value }))}
+                    className="border border-[#30363D] bg-[#0d1117] px-3 py-2 text-[11px] text-[#C9D1D9] outline-none focus:border-[#58A6FF]"
+                  >
+                    <option value="none">No live traffic</option>
+                    <option value="google">Use Google traffic when the existing key is configured</option>
+                    <option value="evaluate-open">Routing only, no live traffic</option>
+                  </select>
+                </WizardField>
+                <div className="rounded-sm border border-[#30363D] bg-[#0d1117] p-4 text-[11px] leading-relaxed text-[#8B949E]">
+                  Keep the current Google map path for now. It is already integrated, supports traffic best, and avoids a full map rewrite before the trip-building UX is stable.
+                </div>
+              </div>
+            ) : null}
+            <div className="mt-6 flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => setVacationStep((current) => Math.max(0, current - 1))}
+                className="border border-[#30363D] bg-[#0d1117] px-3 py-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#8B949E]"
+              >
+                Back
+              </button>
+              <div className="flex gap-2">
+                {vacationStep < 3 ? (
+                  <button
+                    type="button"
+                    onClick={() => setVacationStep((current) => Math.min(3, current + 1))}
+                    className="border border-[#58A6FF]/50 bg-[#58A6FF]/12 px-3 py-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#C9D1D9]"
+                  >
+                    Next
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={saveVacationWizard}
+                    className="border border-[#58A6FF]/50 bg-[#58A6FF]/12 px-3 py-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#C9D1D9]"
+                  >
+                    Save Operation
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {familyWizardOpen && doc.operationProfile?.configuredAt ? (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#0b0f14]/86 backdrop-blur-sm">
-          <div className="w-[420px] border border-[#30363D] bg-[#161b22] p-6 shadow-[0_24px_80px_rgba(0,0,0,0.45)]">
-            <div className="mb-2 text-[10px] font-black uppercase tracking-[0.22em] text-[#58A6FF]">
-              Family Profile
+          <div className="max-h-[88vh] w-[980px] overflow-y-auto border border-[#30363D] bg-[#161b22] p-6 shadow-[0_24px_80px_rgba(0,0,0,0.45)]">
+            <div className="mb-2 text-[10px] font-black uppercase tracking-[0.22em] text-[#D29922]">
+              Family Wizard
             </div>
             <div className="text-[18px] font-black uppercase tracking-[0.08em] text-[#E6EDF3]">
-              Choose your family
+              Build a family-specific plan
             </div>
             <div className="mt-2 text-[12px] leading-relaxed text-[#8B949E]">
-              This stays local in your browser, personalizes the planner to your family, and attributes edits and new expenses to you.
+              This plan stays tied to one family and captures its departure timing, stops, lunch, points of interest, daily schedule, and shareable activities.
+            </div>
+            <div className="mt-4 grid grid-cols-4 gap-2">
+              {['Family', 'Departure', 'Stops', 'Schedule'].map((label, index) => (
+                <button
+                  key={label}
+                  type="button"
+                  onClick={() => setFamilyStep(index)}
+                  className={cn(
+                    'border px-3 py-2 text-left text-[10px] font-black uppercase tracking-[0.16em]',
+                    familyStep === index
+                      ? 'border-[#D29922]/50 bg-[#D29922]/12 text-[#C9D1D9]'
+                      : 'border-[#30363D] bg-[#0d1117] text-[#8B949E]',
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="mt-4 border border-[#30363D] bg-[#0d1117] p-3">
+              <div className="mb-2 text-[9px] font-black uppercase tracking-[0.16em] text-[#58A6FF]">
+                Family Identity
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                <WizardTextInput
+                  value={familyDraft.familyName}
+                  onChange={(event) => setFamilyDraft((current) => ({ ...current, familyId: '', familyName: event.target.value }))}
+                  placeholder="Family name"
+                />
+                <WizardTextInput
+                  value={familyDraft.headcount}
+                  onChange={(event) => setFamilyDraft((current) => ({ ...current, headcount: event.target.value }))}
+                  placeholder="Headcount"
+                />
+                <WizardTextInput
+                  value={familyDraft.origin}
+                  onChange={(event) => setFamilyDraft((current) => ({ ...current, origin: event.target.value }))}
+                  placeholder="Origin"
+                />
+                <WizardTextInput
+                  value={familyDraft.departureLocation}
+                  onChange={(event) => setFamilyDraft((current) => ({ ...current, departureLocation: event.target.value }))}
+                  placeholder="Departure location"
+                />
+                <WizardTextInput
+                  type="date"
+                  value={familyDraft.departureDate}
+                  onChange={(event) => setFamilyDraft((current) => ({ ...current, departureDate: event.target.value }))}
+                />
+                <WizardTextInput
+                  type="time"
+                  value={familyDraft.departureTime}
+                  onChange={(event) => setFamilyDraft((current) => ({ ...current, departureTime: event.target.value }))}
+                />
+                <WizardTextInput
+                  value={familyDraft.arrivalEstimate}
+                  onChange={(event) => setFamilyDraft((current) => ({ ...current, arrivalEstimate: event.target.value }))}
+                  placeholder="Estimated arrival"
+                />
+                <WizardTextInput
+                  value={familyDraft.lunchPlan}
+                  onChange={(event) => setFamilyDraft((current) => ({ ...current, lunchPlan: event.target.value }))}
+                  placeholder="Lunch plan"
+                />
+                <div className="md:col-span-2">
+                  <WizardTextArea
+                    value={familyDraft.notes}
+                    onChange={(event) => setFamilyDraft((current) => ({ ...current, notes: event.target.value }))}
+                    placeholder="Family notes, constraints, routines, or packing reminders"
+                    className="min-h-[72px]"
+                  />
+                </div>
+              </div>
             </div>
             <div className="mt-5 grid gap-2">
               {families.map((family) => (
                 <button
                   key={family.id}
                   type="button"
-                  onClick={() => onSetActiveFamily(family.id)}
+                  onClick={() => {
+                    setFamilyDraft(buildFamilyDraft(family))
+                    setSelectedSharedActivityIds(family.sharedActivityIds || [])
+                  }}
                   className="flex items-center justify-between border border-[#30363D] bg-[#0d1117] px-4 py-3 text-left transition-colors hover:border-[#58A6FF]/40 hover:bg-[#1f2a34]/50"
                 >
                   <div>
@@ -1002,6 +1454,213 @@ function AppShell({
                   <ArrowRight size={14} className="text-[#58A6FF]" />
                 </button>
               ))}
+              {!families.length ? (
+                <div className="border border-[#30363D] bg-[#0d1117] px-3 py-2 text-[11px] text-[#8B949E]">
+                  No families yet. Create one above to continue.
+                </div>
+              ) : null}
+            </div>
+            <div className="mt-5 grid gap-4">
+              <div className="border border-[#30363D] bg-[#0d1117] p-4">
+                <div className="mb-3 text-[9px] font-black uppercase tracking-[0.16em] text-[#58A6FF]">Stops, lunch, and points of interest</div>
+                <div className="grid gap-3">
+                  {familyDraft.stops.map((stop, index) => (
+                    <div key={`${stop.type}-${index}`} className="grid gap-2 md:grid-cols-[120px_1fr_1fr]">
+                      <select
+                        value={stop.type}
+                        onChange={(event) => setFamilyDraft((current) => ({
+                          ...current,
+                          stops: current.stops.map((item, itemIndex) => (
+                            itemIndex === index ? { ...item, type: event.target.value } : item
+                          )),
+                        }))}
+                        className="border border-[#30363D] bg-[#161b22] px-3 py-2 text-[11px] text-[#C9D1D9] outline-none focus:border-[#58A6FF]"
+                      >
+                        {STOP_TYPE_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                      <WizardTextInput
+                        value={stop.title}
+                        onChange={(event) => setFamilyDraft((current) => ({
+                          ...current,
+                          stops: current.stops.map((item, itemIndex) => (
+                            itemIndex === index ? { ...item, title: event.target.value } : item
+                          )),
+                        }))}
+                        placeholder="Stop title"
+                      />
+                      <WizardTextInput
+                        value={stop.address}
+                        onChange={(event) => setFamilyDraft((current) => ({
+                          ...current,
+                          stops: current.stops.map((item, itemIndex) => (
+                            itemIndex === index ? { ...item, address: event.target.value } : item
+                          )),
+                        }))}
+                        placeholder="Address or area"
+                      />
+                      <div className="md:col-span-3">
+                        <WizardTextArea
+                          value={stop.note}
+                          onChange={(event) => setFamilyDraft((current) => ({
+                            ...current,
+                            stops: current.stops.map((item, itemIndex) => (
+                              itemIndex === index ? { ...item, note: event.target.value } : item
+                            )),
+                          }))}
+                          placeholder="Notes, comments, lunch details, or point-of-interest context"
+                          className="min-h-[60px]"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setFamilyDraft((current) => ({ ...current, stops: [...current.stops, createFamilyStopDraft('stop')] }))}
+                      className="border border-[#30363D] bg-[#161b22] px-3 py-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#58A6FF]"
+                    >
+                      Add stop
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFamilyDraft((current) => ({ ...current, stops: [...current.stops, createFamilyStopDraft('poi')] }))}
+                      className="border border-[#30363D] bg-[#161b22] px-3 py-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#D29922]"
+                    >
+                      Add poi
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div className="border border-[#30363D] bg-[#0d1117] p-4">
+                <div className="mb-3 text-[9px] font-black uppercase tracking-[0.16em] text-[#58A6FF]">Daily schedule and shareable activities</div>
+                <div className="grid gap-3">
+                  {familyDraft.dailySchedule.map((entry, index) => (
+                    <div key={`${entry.dayId}-${index}`} className="grid gap-2 md:grid-cols-[140px_100px_1fr]">
+                      <select
+                        value={entry.dayId}
+                        onChange={(event) => setFamilyDraft((current) => ({
+                          ...current,
+                          dailySchedule: current.dailySchedule.map((item, itemIndex) => (
+                            itemIndex === index ? { ...item, dayId: event.target.value } : item
+                          )),
+                        }))}
+                        className="border border-[#30363D] bg-[#161b22] px-3 py-2 text-[11px] text-[#C9D1D9] outline-none focus:border-[#58A6FF]"
+                      >
+                        {FAMILY_WIZARD_DAY_OPTIONS.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                      <WizardTextInput
+                        value={entry.time}
+                        onChange={(event) => setFamilyDraft((current) => ({
+                          ...current,
+                          dailySchedule: current.dailySchedule.map((item, itemIndex) => (
+                            itemIndex === index ? { ...item, time: event.target.value } : item
+                          )),
+                        }))}
+                        placeholder="Time"
+                      />
+                      <WizardTextInput
+                        value={entry.title}
+                        onChange={(event) => setFamilyDraft((current) => ({
+                          ...current,
+                          dailySchedule: current.dailySchedule.map((item, itemIndex) => (
+                            itemIndex === index ? { ...item, title: event.target.value } : item
+                          )),
+                        }))}
+                        placeholder="Activity title"
+                      />
+                      <div className="md:col-span-3">
+                        <WizardTextInput
+                          value={entry.location}
+                          onChange={(event) => setFamilyDraft((current) => ({
+                            ...current,
+                            dailySchedule: current.dailySchedule.map((item, itemIndex) => (
+                              itemIndex === index ? { ...item, location: event.target.value } : item
+                            )),
+                          }))}
+                          placeholder="Activity location"
+                        />
+                      </div>
+                      <div className="md:col-span-3">
+                        <WizardTextArea
+                          value={entry.note}
+                          onChange={(event) => setFamilyDraft((current) => ({
+                            ...current,
+                            dailySchedule: current.dailySchedule.map((item, itemIndex) => (
+                              itemIndex === index ? { ...item, note: event.target.value } : item
+                            )),
+                          }))}
+                          placeholder="Activity comments or notes"
+                          className="min-h-[60px]"
+                        />
+                      </div>
+                      <label className="md:col-span-3 flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#8B949E]">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(entry.shareable)}
+                          onChange={(event) => setFamilyDraft((current) => ({
+                            ...current,
+                            dailySchedule: current.dailySchedule.map((item, itemIndex) => (
+                              itemIndex === index ? { ...item, shareable: event.target.checked } : item
+                            )),
+                          }))}
+                        />
+                        Share this activity with other families
+                      </label>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setFamilyDraft((current) => ({ ...current, dailySchedule: [...current.dailySchedule, createScheduleDraft('fri')] }))}
+                    className="border border-[#30363D] bg-[#161b22] px-3 py-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#58A6FF]"
+                  >
+                    Add activity
+                  </button>
+                </div>
+              </div>
+              <div className="border border-[#30363D] bg-[#0d1117] p-4">
+                <div className="mb-3 text-[9px] font-black uppercase tracking-[0.16em] text-[#58A6FF]">Shared activities from other families</div>
+                <div className="grid gap-2">
+                  {shareableActivityOptions.map((activity) => (
+                    <label key={activity.id} className="flex items-start justify-between gap-3 border border-[#30363D] bg-[#161b22] p-3">
+                      <div>
+                        <div className="text-[11px] font-black uppercase tracking-[0.12em] text-[#C9D1D9]">{activity.title}</div>
+                        <div className="mt-1 text-[10px] text-[#8B949E]">{activity.window}</div>
+                      </div>
+                      <input
+                        type="checkbox"
+                        checked={selectedSharedActivityIds.includes(activity.id)}
+                        onChange={(event) => setSelectedSharedActivityIds((current) => (
+                          event.target.checked
+                            ? [...current, activity.id]
+                            : current.filter((id) => id !== activity.id)
+                        ))}
+                      />
+                    </label>
+                  ))}
+                  {!shareableActivityOptions.length ? (
+                    <div className="border border-[#30363D] bg-[#161b22] px-3 py-2 text-[11px] text-[#8B949E]">
+                      No shared activities yet.
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={saveFamilyWizard}
+                  className="border border-[#D29922]/50 bg-[#D29922]/12 px-3 py-2 text-[10px] font-black uppercase tracking-[0.14em] text-[#C9D1D9]"
+                >
+                  Save Family Plan
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -3198,6 +3857,18 @@ function ActivitiesPage({ doc, selection, onSelectEntity, onUpdatePageNote, onCo
               <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-[#58A6FF]">
                 {activity.window}
               </div>
+              {activity.shareable || (activity.participantFamilyIds && activity.participantFamilyIds.length) ? (
+                <div className="mb-3 flex flex-wrap gap-2 text-[9px] font-black uppercase tracking-[0.16em]">
+                  {activity.shareable ? (
+                    <span className="border border-[#58A6FF]/40 bg-[#58A6FF]/10 px-2 py-1 text-[#58A6FF]">Shareable</span>
+                  ) : null}
+                  {activity.participantFamilyIds?.length ? (
+                    <span className="border border-[#30363D] bg-[#0d1117] px-2 py-1 text-[#C9D1D9]">
+                      {activity.participantFamilyIds.length + 1} families aligned
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
               <p className="mb-3 text-[11px] leading-relaxed text-[#C9D1D9]">{activity.description}</p>
               <div className="border-t border-[#30363D]/50 pt-3 text-[10px] leading-relaxed text-[#8B949E]">
                 <span className="font-black uppercase tracking-widest text-[#D29922]">Fallback:</span> {activity.backup}
@@ -3795,6 +4466,170 @@ function ExpensesPage({
   )
 }
 
+function WizardField({ label, children, hint }) {
+  return (
+    <label className="grid gap-1.5">
+      <span className="text-[9px] font-black uppercase tracking-[0.18em] text-[#8B949E]">{label}</span>
+      {children}
+      {hint ? <span className="text-[10px] text-[#8B949E]">{hint}</span> : null}
+    </label>
+  )
+}
+
+function WizardTextInput(props) {
+  return (
+    <input
+      {...props}
+      className={cn(
+        'border border-[#30363D] bg-[#0d1117] px-3 py-2 text-[11px] text-[#C9D1D9] outline-none focus:border-[#58A6FF]',
+        props.className,
+      )}
+    />
+  )
+}
+
+function WizardTextArea(props) {
+  return (
+    <textarea
+      {...props}
+      className={cn(
+        'min-h-[88px] border border-[#30363D] bg-[#0d1117] px-3 py-2 text-[11px] leading-relaxed text-[#C9D1D9] outline-none focus:border-[#58A6FF]',
+        props.className,
+      )}
+    />
+  )
+}
+
+function OpsConfigPage({
+  doc,
+  onSelectEntity,
+  onUpdateCollectionItem,
+  onRemoveCollectionItem,
+  onAddCollectionItem,
+}) {
+  const [collectionKey, setCollectionKey] = useState('families')
+  const [selectedItemId, setSelectedItemId] = useState('')
+  const [draft, setDraft] = useState('{}')
+  const collectionConfig = OPS_COLLECTION_CONFIG.find((item) => item.key === collectionKey) || OPS_COLLECTION_CONFIG[0]
+  const items = doc[collectionConfig.key] || []
+
+  useEffect(() => {
+    if (!items.length) {
+      setSelectedItemId('')
+      setDraft('{}')
+      return
+    }
+    const existing = items.find((item) => item.id === selectedItemId)
+    const nextItem = existing || items[0]
+    setSelectedItemId(nextItem.id)
+    setDraft(JSON.stringify(nextItem, null, 2))
+  }, [collectionKey, items, selectedItemId])
+
+  const selectedItem = items.find((item) => item.id === selectedItemId) || null
+
+  const saveDraft = () => {
+    if (!selectedItemId) return
+    try {
+      const parsed = JSON.parse(draft)
+      onUpdateCollectionItem(collectionConfig.key, selectedItemId, parsed)
+    } catch {
+      // Keep invalid JSON local until user fixes it.
+    }
+  }
+
+  return (
+    <div className="grid min-h-0 flex-1 grid-cols-[320px_1fr] overflow-hidden">
+      <div className="overflow-y-auto border-r border-[#30363D] bg-[#161b22] p-5">
+        <SectionTitle eyebrow="Operation Builder" title="Entity collections" />
+        <div className="mb-4 grid gap-2">
+          {OPS_COLLECTION_CONFIG.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              onClick={() => setCollectionKey(item.key)}
+              className={cn(
+                'border px-3 py-2 text-left text-[10px] font-black uppercase tracking-[0.16em]',
+                collectionKey === item.key
+                  ? 'border-[#58A6FF]/50 bg-[#58A6FF]/12 text-[#C9D1D9]'
+                  : 'border-[#30363D] bg-[#0d1117] text-[#8B949E]',
+              )}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+        <div className="mb-2 flex items-center justify-between">
+          <div className="text-[9px] font-black uppercase tracking-[0.16em] text-[#8B949E]">
+            {collectionConfig.label}
+          </div>
+          <button
+            type="button"
+            onClick={() => onAddCollectionItem(collectionConfig.key, collectionConfig.type)}
+            className="border border-[#30363D] bg-[#0d1117] px-2 py-1 text-[9px] font-black uppercase tracking-[0.14em] text-[#58A6FF]"
+          >
+            Add
+          </button>
+        </div>
+        <div className="overflow-hidden border border-[#30363D] bg-[#0d1117]">
+          {items.map((item) => (
+            <div key={item.id} className="flex items-center border-b border-[#30363D]/40 last:border-b-0">
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedItemId(item.id)
+                  setDraft(JSON.stringify(item, null, 2))
+                  onSelectEntity(collectionConfig.type, item.id)
+                }}
+                className={cn(
+                  'flex-1 px-3 py-2 text-left text-[10px] font-bold',
+                  selectedItemId === item.id ? 'bg-[#24313d] text-[#C9D1D9]' : 'text-[#8B949E] hover:bg-[#1f2a34]',
+                )}
+              >
+                {item.title || item.name || item.label || item.id}
+              </button>
+              <button
+                type="button"
+                onClick={() => onRemoveCollectionItem(collectionConfig.key, item.id, collectionConfig.type)}
+                className="px-2 text-[#F85149]"
+                title="Remove"
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="overflow-y-auto bg-[#0d1117] p-6">
+        <SectionTitle eyebrow="Raw Editor" title={selectedItem ? (selectedItem.title || selectedItem.id) : 'No item selected'} />
+        <div className="mb-3 text-[11px] text-[#8B949E]">
+          Edit any fields directly as JSON to customize this operation.
+        </div>
+        <textarea
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          className="h-[65vh] w-full resize-none border border-[#30363D] bg-[#11161d] px-3 py-3 font-mono text-[11px] leading-relaxed text-[#C9D1D9] outline-none focus:border-[#58A6FF]"
+        />
+        <div className="mt-3 flex gap-2">
+          <button
+            type="button"
+            onClick={saveDraft}
+            className="border border-[#58A6FF]/50 bg-[#58A6FF]/12 px-3 py-2 text-[10px] font-black uppercase tracking-[0.16em] text-[#C9D1D9]"
+          >
+            Save item
+          </button>
+          <button
+            type="button"
+            onClick={() => selectedItem && setDraft(JSON.stringify(selectedItem, null, 2))}
+            className="border border-[#30363D] bg-[#11161d] px-3 py-2 text-[10px] font-black uppercase tracking-[0.16em] text-[#8B949E]"
+          >
+            Reset draft
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function FamiliesPage({ doc, selection, onSelectEntity, onUpdatePageNote, onConvertPageNote }) {
   return (
     <div className="grid min-h-0 flex-1 grid-cols-[360px_1fr] overflow-hidden">
@@ -3868,14 +4703,45 @@ function withRefreshedFamilies(nextDoc) {
 }
 
 function App() {
-  const [doc, setDoc] = usePersistedTripState(TRIP_DOCUMENT_STORAGE_KEY, getInitialTripDocument())
+  const [operationsState, setOperationsState] = usePersistedTripState(OPS_STORAGE_KEY, null)
+  const [doc, setDoc] = useMemo(() => {
+    const initialDoc = createInitialTripDocument()
+    const bootstrapState = operationsState && operationsState.operations?.length
+      ? operationsState
+      : {
+          activeOperationId: 'op-default',
+          operations: [{ id: 'op-default', name: 'Default Operation' }],
+          docs: { 'op-default': initialDoc },
+        }
+
+    const activeOperationId = bootstrapState.activeOperationId || bootstrapState.operations[0]?.id || 'op-default'
+    const activeDoc = bootstrapState.docs?.[activeOperationId] || initialDoc
+
+    const setDocForOperation = (updater) => {
+      setOperationsState((current) => {
+        const safeCurrent = current && current.operations?.length
+          ? current
+          : bootstrapState
+        const currentDoc = safeCurrent.docs?.[activeOperationId] || initialDoc
+        const nextDoc = typeof updater === 'function' ? updater(currentDoc) : updater
+        return {
+          ...safeCurrent,
+          docs: {
+            ...safeCurrent.docs,
+            [activeOperationId]: nextDoc,
+          },
+        }
+      })
+    }
+
+    return [activeDoc, setDocForOperation]
+  }, [operationsState, setOperationsState])
   const [viewerProfile, setViewerProfile] = usePersistedTripState(VIEWER_PROFILE_STORAGE_KEY, { familyId: null })
   const visibilityMode = PUBLISH_CONFIG.visibilityMode
   const liveExternalData = isLiveExternalDataEnabled()
   const displayDoc = useMemo(() => projectTripDocument(doc, visibilityMode), [doc, visibilityMode])
   const locationIntelHydrationRef = useRef(new Set())
   const startupTimelineSyncRef = useRef(false)
-  const seededPlanRefreshRef = useRef(false)
   const [weatherState, setWeatherState] = useState({
     status: 'loading',
     targets: {},
@@ -3889,14 +4755,275 @@ function App() {
   const selectedEntity = getEntityBySelection(displayDoc, selection)
   const selectedLocation = getLocationForEntity(displayDoc, selectedEntity)
   const selectedRoute = getRouteForEntity(displayDoc, selectedEntity)
+  const operations = operationsState?.operations || [{ id: 'op-default', name: 'Default Operation' }]
+  const activeOperationId = operationsState?.activeOperationId || operations[0].id
 
   useEffect(() => {
     clearLegacyTripStorage()
   }, [])
 
+  useEffect(() => {
+    if (operationsState && operationsState.operations?.length) return
+    setOperationsState({
+      activeOperationId: 'op-default',
+      operations: [{ id: 'op-default', name: 'Default Operation' }],
+      docs: { 'op-default': createInitialTripDocument() },
+    })
+  }, [operationsState, setOperationsState])
+
   const setActiveFamilyProfile = useCallback((familyId) => {
     setViewerProfile({ familyId })
   }, [setViewerProfile])
+
+  const createFamilyFromGate = useCallback(({ name, origin, headcount }) => {
+    const trimmedName = name?.trim()
+    if (!trimmedName) return null
+    const familyId = `family-user-${Date.now()}`
+    const shortOrigin = origin?.trim() ? origin.trim().slice(0, 3).toUpperCase() : 'OPS'
+    const family = {
+      id: familyId,
+      type: 'family',
+      title: trimmedName,
+      name: trimmedName,
+      origin: origin?.trim() || 'Unspecified',
+      shortOrigin,
+      status: 'Pending',
+      eta: '',
+      driveTime: '',
+      headcount: headcount?.trim() || '1 adult',
+      vehicle: 'Unassigned',
+      vehicleLabel: '',
+      responsibility: '',
+      readiness: 100,
+      routeSummary: '',
+      plannedStopIds: [],
+      linkedEntityKeys: [],
+      note: '',
+      travelStops: [],
+      dailySchedule: [],
+      sharedActivityIds: [],
+    }
+    setDoc((current) => ({
+      ...current,
+      families: [...current.families, family],
+      selection: { type: 'family', id: familyId },
+    }))
+    setViewerProfile({ familyId })
+    return familyId
+  }, [setDoc, setViewerProfile])
+
+  const saveOperationProfile = useCallback((profile) => {
+    const configuredAt = new Date().toISOString()
+    setDoc((current) => {
+      const destinationId = 'operation-destination'
+      const nextLocation = {
+        id: destinationId,
+        type: 'location',
+        title: profile.destinationLabel.trim(),
+        category: profile.destinationType === 'hotel' || profile.destinationType === 'basecamp' ? 'stay' : 'activity',
+        summary: profile.destinationNotes?.trim() || profile.summary?.trim() || '',
+        address: profile.destinationAddress?.trim() || '',
+        dayId: 'all',
+        note: profile.destinationNotes?.trim() || '',
+      }
+      const locationExists = current.locations.some((location) => location.id === destinationId)
+      return {
+        ...current,
+        operationProfile: {
+          ...current.operationProfile,
+          ...profile,
+          configuredAt,
+        },
+        locations: profile.destinationLabel?.trim()
+          ? locationExists
+            ? current.locations.map((location) => (location.id === destinationId ? { ...location, ...nextLocation } : location))
+            : [...current.locations, nextLocation]
+          : current.locations,
+      }
+    })
+  }, [setDoc])
+
+  const saveFamilyPlan = useCallback((draft, sharedActivityIds = []) => {
+    const familyName = draft.familyName?.trim()
+    if (!familyName) return null
+
+    const familyId = draft.familyId || `family-user-${Date.now()}`
+    setDoc((current) => {
+      const shortOrigin = draft.origin?.trim() ? draft.origin.trim().slice(0, 3).toUpperCase() : 'OPS'
+      const cleanedStops = (draft.stops || []).filter((stop) => stop.title?.trim() || stop.address?.trim())
+      const cleanedSchedule = (draft.dailySchedule || []).filter((entry) => entry.title?.trim())
+
+      const generatedLocationIds = new Set()
+      const generatedLocations = cleanedStops.map((stop, index) => {
+        const locationId = `${familyId}-${stop.type || 'stop'}-${slugify(stop.title || stop.address || `stop-${index}`)}-${index}`
+        generatedLocationIds.add(locationId)
+        return stampFamilyMetadata({
+          id: locationId,
+          type: 'location',
+          title: stop.title?.trim() || `${familyName} stop ${index + 1}`,
+          category: stop.type === 'meal' ? 'meal' : stop.type === 'poi' ? 'activity' : 'logistics',
+          address: stop.address?.trim() || '',
+          summary: stop.note?.trim() || '',
+          note: stop.note?.trim() || '',
+          ownerFamilyId: familyId,
+          generatedByFamilyPlan: true,
+          dayId: 'travel',
+        }, familyId)
+      })
+
+      const otherLocations = current.locations.filter((location) => !(location.generatedByFamilyPlan && location.ownerFamilyId === familyId))
+      const routeId = `route-family-${familyId}`
+      const destinationLocationId = current.locations.some((location) => location.id === 'operation-destination') ? 'operation-destination' : null
+      const nextRoute = stampFamilyMetadata({
+        id: routeId,
+        type: 'route',
+        title: `${familyName} travel plan`,
+        ownerFamilyId: familyId,
+        originAddress: draft.departureLocation?.trim() || draft.origin?.trim() || '',
+        originCoordinates: null,
+        destinationLocationId,
+        stopLocationIds: [...generatedLocationIds],
+        path: [],
+        note: draft.lunchPlan?.trim() || '',
+        generatedByFamilyPlan: true,
+      }, familyId)
+
+      const otherRoutes = current.routes.filter((route) => route.id !== routeId)
+      const nextActivitiesBase = current.activities.filter((activity) => !(activity.generatedByFamilyPlan && activity.ownerFamilyId === familyId))
+      const generatedActivities = cleanedSchedule.map((entry, index) => stampFamilyMetadata({
+        id: `activity-${familyId}-${entry.dayId || 'day'}-${index}`,
+        type: 'activity',
+        title: entry.title.trim(),
+        dayId: entry.dayId === 'travel' ? 'thu' : (entry.dayId || 'fri'),
+        window: [entry.time, entry.location].filter(Boolean).join(' · ') || 'Flexible window',
+        status: 'Pending',
+        riskLevel: 'Low',
+        weatherSensitivity: 'Low',
+        description: entry.note?.trim() || `${familyName} planned activity`,
+        backup: 'Coordinate a lighter fallback if timing slips.',
+        note: entry.note?.trim() || '',
+        ownerFamilyId: familyId,
+        locationId: null,
+        shareable: Boolean(entry.shareable),
+        participantFamilyIds: [],
+        generatedByFamilyPlan: true,
+      }, familyId))
+
+      const nextActivities = nextActivitiesBase
+        .map((activity) => {
+          if (!sharedActivityIds.includes(activity.id)) {
+            return activity.ownerFamilyId === familyId
+              ? activity
+              : { ...activity, participantFamilyIds: (activity.participantFamilyIds || []).filter((id) => id !== familyId) }
+          }
+          return activity.ownerFamilyId === familyId
+            ? activity
+            : { ...activity, participantFamilyIds: [...new Set([...(activity.participantFamilyIds || []), familyId])] }
+        })
+        .concat(generatedActivities)
+
+      const nextFamily = {
+        id: familyId,
+        type: 'family',
+        title: familyName,
+        name: familyName,
+        origin: draft.origin?.trim() || 'Unspecified',
+        shortOrigin,
+        status: draft.departureDate || draft.departureTime ? 'Transit' : 'Pending',
+        eta: draft.arrivalEstimate?.trim() || '',
+        departureDate: draft.departureDate || '',
+        departureTime: draft.departureTime || '',
+        departureLocation: draft.departureLocation?.trim() || '',
+        driveTime: '',
+        headcount: draft.headcount?.trim() || '1 adult',
+        vehicle: 'Unassigned',
+        vehicleLabel: '',
+        responsibility: '',
+        readiness: 100,
+        routeSummary: draft.lunchPlan?.trim() || '',
+        plannedStopIds: [...generatedLocationIds],
+        linkedEntityKeys: [],
+        note: draft.notes?.trim() || '',
+        lunchPlan: draft.lunchPlan?.trim() || '',
+        travelStops: cleanedStops,
+        dailySchedule: cleanedSchedule,
+        sharedActivityIds,
+      }
+
+      const familyExists = current.families.some((family) => family.id === familyId)
+      const families = familyExists
+        ? current.families.map((family) => (family.id === familyId ? stampFamilyMetadata({ ...family, ...nextFamily }, familyId) : family))
+        : [...current.families, stampFamilyMetadata(nextFamily, familyId)]
+
+      return {
+        ...current,
+        families,
+        locations: [...otherLocations, ...generatedLocations],
+        routes: synchronizeRoutePaths([...otherRoutes, nextRoute], [...otherLocations, ...generatedLocations]),
+        activities: nextActivities,
+        selection: { type: 'family', id: familyId },
+      }
+    })
+    return familyId
+  }, [setDoc])
+
+  const createOperation = useCallback(() => {
+    const name = window.prompt('Operation name')
+    if (!name?.trim()) return
+    const operationId = `op-${Date.now()}`
+    const baseDoc = createInitialTripDocument()
+    baseDoc.selection = ensureSelectionForPage(baseDoc, baseDoc.selectedPage)
+    setOperationsState((current) => {
+      const safeCurrent = current && current.operations?.length
+        ? current
+        : {
+            activeOperationId: 'op-default',
+            operations: [{ id: 'op-default', name: 'Default Operation' }],
+            docs: { 'op-default': createInitialTripDocument() },
+          }
+      return {
+        ...safeCurrent,
+        activeOperationId: operationId,
+        operations: [...safeCurrent.operations, { id: operationId, name: name.trim() }],
+        docs: {
+          ...safeCurrent.docs,
+          [operationId]: baseDoc,
+        },
+      }
+    })
+  }, [setOperationsState])
+
+  const selectOperation = useCallback((operationId) => {
+    setOperationsState((current) => {
+      if (!current || current.activeOperationId === operationId) return current
+      return { ...current, activeOperationId: operationId }
+    })
+    setViewerProfile({ familyId: null })
+  }, [setOperationsState, setViewerProfile])
+
+  const deleteOperation = useCallback(() => {
+    if (!operationsState?.operations?.length || operationsState.operations.length === 1) return
+    const targetId = operationsState.activeOperationId
+    const target = operationsState.operations.find((item) => item.id === targetId)
+    if (!target) return
+    const approved = window.confirm(`Delete operation "${target.name}"?`)
+    if (!approved) return
+
+    setOperationsState((current) => {
+      if (!current || !current.operations?.length || current.operations.length === 1) return current
+      const nextOperations = current.operations.filter((item) => item.id !== targetId)
+      const nextActiveId = nextOperations[0]?.id || 'op-default'
+      const nextDocs = { ...current.docs }
+      delete nextDocs[targetId]
+      return {
+        ...current,
+        activeOperationId: nextActiveId,
+        operations: nextOperations,
+        docs: nextDocs,
+      }
+    })
+    setViewerProfile({ familyId: null })
+  }, [operationsState, setOperationsState, setViewerProfile])
 
   useEffect(() => {
     if (startupTimelineSyncRef.current) return
@@ -3920,230 +5047,7 @@ function App() {
     }))
   }, [setDoc])
 
-  useEffect(() => {
-    const jiangRoute = doc.routes.find((route) => route.id === 'route-la-north-star')
-    const jiangFamily = doc.families.find((family) => family.id === 'north-star')
-    const yosemiteLocation = doc.locations.find((location) => location.id === 'yosemite')
-    const missingStopLocations = JIANG_ROAD_TRIP_STOP_DEFAULTS.filter(
-      (stop) => !doc.locations.some((location) => location.id === stop.id),
-    )
-
-    const needsRouteStops = jiangRoute && !jiangRoute.stopLocationIds?.length
-    const needsFamilyStops = jiangFamily && !jiangFamily.plannedStopIds?.length
-    const needsVehicleFamilyBackfill = doc.families.some((family) => {
-      const defaults = FAMILY_VEHICLE_DEFAULTS[family.id]
-      if (!defaults) return false
-      return (
-        !family.originAddress ||
-        !family.originCoordinates ||
-        !family.vehicleLabel ||
-        (defaults.plannedStopIds?.length && !family.plannedStopIds?.length)
-      )
-    })
-    const needsVehicleRouteBackfill = doc.routes.some((route) => {
-      const defaults = ROUTE_SIM_DEFAULTS[route.id]
-      if (!defaults) return false
-      return (
-        ('simulationStartSlot' in defaults && route.simulationStartSlot == null) ||
-        ('simulationEndSlot' in defaults && route.simulationEndSlot == null) ||
-        ('durationSeconds' in defaults && route.durationSeconds == null) ||
-        ('originCoordinates' in defaults && !route.originCoordinates) ||
-        ('destinationLocationId' in defaults && !route.destinationLocationId) ||
-        ('stopLocationIds' in defaults && !Array.isArray(route.stopLocationIds))
-      )
-    })
-    const needsYosemiteBackfill =
-      yosemiteLocation &&
-      (
-        yosemiteLocation.title !== YOSEMITE_ROUTE_DEFAULTS.title ||
-        yosemiteLocation.placesQuery !== YOSEMITE_ROUTE_DEFAULTS.placesQuery ||
-        yosemiteLocation.coordinates?.lat !== YOSEMITE_ROUTE_DEFAULTS.coordinates.lat ||
-        yosemiteLocation.coordinates?.lng !== YOSEMITE_ROUTE_DEFAULTS.coordinates.lng
-      )
-
-    if (
-      !needsRouteStops &&
-      !needsFamilyStops &&
-      !missingStopLocations.length &&
-      !needsVehicleFamilyBackfill &&
-      !needsVehicleRouteBackfill &&
-      !needsYosemiteBackfill
-    ) {
-      return
-    }
-
-    setDoc((current) => {
-      const nextLocations = [
-        ...current.locations,
-        ...JIANG_ROAD_TRIP_STOP_DEFAULTS.filter(
-          (stop) => !current.locations.some((location) => location.id === stop.id),
-        ),
-      ].map((location) =>
-        location.id === 'yosemite'
-          ? {
-              ...location,
-              ...YOSEMITE_ROUTE_DEFAULTS,
-            }
-          : location,
-      )
-      const nextFamilies = current.families.map((family) => {
-        const defaults = FAMILY_VEHICLE_DEFAULTS[family.id]
-        if (!defaults && family.id !== 'north-star') return family
-
-        return {
-          ...family,
-          originAddress: family.originAddress || defaults?.originAddress,
-          originCoordinates: family.originCoordinates || defaults?.originCoordinates,
-          vehicleLabel: family.vehicleLabel || defaults?.vehicleLabel,
-          plannedStopIds: family.plannedStopIds?.length ? family.plannedStopIds : defaults?.plannedStopIds || family.plannedStopIds,
-          routeSummary: family.routeSummary || defaults?.routeSummary || family.routeSummary,
-        }
-      })
-
-      const nextRoutes = synchronizeRoutePaths(
-        current.routes.map((route) => {
-          const defaults = ROUTE_SIM_DEFAULTS[route.id]
-          if (!defaults) return route
-
-          return {
-            ...route,
-            originCoordinates: route.originCoordinates || defaults.originCoordinates || route.path?.[0],
-            path:
-              route.path?.length > 1 && defaults.originCoordinates
-                ? [route.originCoordinates || defaults.originCoordinates, ...route.path.slice(1)]
-                : route.path,
-            stopLocationIds:
-              Array.isArray(route.stopLocationIds)
-                ? route.stopLocationIds
-                : defaults.stopLocationIds ?? route.stopLocationIds,
-            destinationLocationId: route.destinationLocationId || defaults.destinationLocationId || route.destinationLocationId,
-            simulationStartSlot:
-              'simulationStartSlot' in defaults
-                ? route.simulationStartSlot ?? defaults.simulationStartSlot
-                : route.simulationStartSlot,
-            simulationEndSlot:
-              'simulationEndSlot' in defaults
-                ? route.simulationEndSlot ?? defaults.simulationEndSlot
-                : route.simulationEndSlot,
-            durationSeconds:
-              'durationSeconds' in defaults
-                ? route.durationSeconds ?? defaults.durationSeconds
-                : route.durationSeconds,
-            simulationMilestones:
-              'simulationMilestones' in defaults
-                ? route.simulationMilestones?.length ? route.simulationMilestones : defaults.simulationMilestones
-                : route.simulationMilestones,
-          }
-        }),
-        nextLocations,
-      )
-
-      return {
-        ...current,
-        locations: nextLocations,
-        families: nextFamilies,
-        routes: nextRoutes,
-      }
-    })
-  }, [doc.families, doc.locations, doc.routes, setDoc])
-
-  useEffect(() => {
-    if (seededPlanRefreshRef.current) return
-
-    const initialDoc = getInitialTripDocument()
-    const currentById = (collection) => new Map(collection.map((item) => [item.id, item]))
-    const collectionNeedsRefresh = (currentCollection, initialCollection, refreshIds) => {
-      const currentMap = currentById(currentCollection)
-      const initialMap = currentById(initialCollection)
-      return [...refreshIds].some((id) => {
-        const currentItem = currentMap.get(id)
-        const initialItem = initialMap.get(id)
-        return !currentItem || !initialItem || JSON.stringify(currentItem) !== JSON.stringify(initialItem)
-      })
-    }
-    const missingRoutes = initialDoc.routes.filter((route) => !doc.routes.some((currentRoute) => currentRoute.id === route.id))
-    const missingItineraryItems = initialDoc.itineraryItems.filter(
-      (item) => !doc.itineraryItems.some((currentItem) => currentItem.id === item.id),
-    )
-    const hasObsoleteRoutes = doc.routes.some((route) => OBSOLETE_PLAN_ROUTE_IDS.has(route.id))
-    const hasObsoleteItineraryItems = doc.itineraryItems.some((item) => OBSOLETE_PLAN_ITINERARY_IDS.has(item.id))
-    const needsPlanRefresh =
-      collectionNeedsRefresh(doc.families, initialDoc.families, SEEDED_PLAN_REFRESH_IDS.families) ||
-      collectionNeedsRefresh(doc.locations, initialDoc.locations, SEEDED_PLAN_REFRESH_IDS.locations) ||
-      collectionNeedsRefresh(doc.meals, initialDoc.meals, SEEDED_PLAN_REFRESH_IDS.meals) ||
-      collectionNeedsRefresh(doc.activities, initialDoc.activities, SEEDED_PLAN_REFRESH_IDS.activities) ||
-      collectionNeedsRefresh(doc.tasks, initialDoc.tasks, SEEDED_PLAN_REFRESH_IDS.tasks) ||
-      collectionNeedsRefresh(doc.routes, initialDoc.routes, SEEDED_PLAN_REFRESH_IDS.routes) ||
-      collectionNeedsRefresh(doc.itineraryItems, initialDoc.itineraryItems, SEEDED_PLAN_REFRESH_IDS.itineraryItems)
-
-    if (!missingRoutes.length && !missingItineraryItems.length && !hasObsoleteRoutes && !hasObsoleteItineraryItems && !needsPlanRefresh) {
-      seededPlanRefreshRef.current = true
-      return
-    }
-
-    seededPlanRefreshRef.current = true
-    setDoc((current) => {
-      const syncCollection = (currentCollection, initialCollection, refreshIds, obsoleteIds = new Set()) => {
-        const initialMap = new Map(initialCollection.map((item) => [item.id, item]))
-        const filtered = currentCollection.filter((item) => !obsoleteIds.has(item.id))
-        const existingIds = new Set(filtered.map((item) => item.id))
-        const replaced = filtered.map((item) => (refreshIds.has(item.id) && initialMap.has(item.id) ? initialMap.get(item.id) : item))
-        const additions = [...refreshIds]
-          .filter((id) => !existingIds.has(id) && initialMap.has(id))
-          .map((id) => initialMap.get(id))
-        return [...replaced, ...additions]
-      }
-
-      const nextLocations = syncCollection(
-        current.locations,
-        initialDoc.locations,
-        SEEDED_PLAN_REFRESH_IDS.locations,
-      )
-      const nextRoutes = synchronizeRoutePaths(
-        syncCollection(
-          [
-            ...current.routes,
-            ...initialDoc.routes.filter((route) => !current.routes.some((currentRoute) => currentRoute.id === route.id)),
-          ],
-          initialDoc.routes,
-          SEEDED_PLAN_REFRESH_IDS.routes,
-          OBSOLETE_PLAN_ROUTE_IDS,
-        ),
-        nextLocations,
-      )
-      const nextItineraryItems = syncCollection(
-        [
-          ...current.itineraryItems,
-          ...initialDoc.itineraryItems.filter((item) => !current.itineraryItems.some((currentItem) => currentItem.id === item.id)),
-        ],
-        initialDoc.itineraryItems,
-        SEEDED_PLAN_REFRESH_IDS.itineraryItems,
-        OBSOLETE_PLAN_ITINERARY_IDS,
-      )
-      const nextSelection =
-        (current.selection?.type === 'route' && OBSOLETE_PLAN_ROUTE_IDS.has(current.selection.id)) ||
-        (current.selection?.type === 'itineraryItem' && OBSOLETE_PLAN_ITINERARY_IDS.has(current.selection.id))
-          ? initialDoc.selection
-          : current.selection
-
-      return {
-        ...current,
-        selection: nextSelection,
-        pageNotes: {
-          ...current.pageNotes,
-          meals: initialDoc.pageNotes.meals,
-          activities: initialDoc.pageNotes.activities,
-        },
-        families: syncCollection(current.families, initialDoc.families, SEEDED_PLAN_REFRESH_IDS.families),
-        locations: nextLocations,
-        meals: syncCollection(current.meals, initialDoc.meals, SEEDED_PLAN_REFRESH_IDS.meals),
-        activities: syncCollection(current.activities, initialDoc.activities, SEEDED_PLAN_REFRESH_IDS.activities),
-        tasks: syncCollection(current.tasks, initialDoc.tasks, SEEDED_PLAN_REFRESH_IDS.tasks),
-        routes: nextRoutes,
-        itineraryItems: nextItineraryItems,
-      }
-    })
-  }, [doc.activities, doc.families, doc.itineraryItems, doc.locations, doc.meals, doc.routes, doc.tasks, setDoc])
+  // Intentionally no seeded backfill or plan refresh; operations should remain fully user-defined.
   const searchResults = useMemo(
     () => getSearchResults(displayDoc, displayDoc.ui.searchQuery),
     [displayDoc],
@@ -4485,27 +5389,63 @@ function App() {
       return
     }
 
-    const basecamp = doc.locations.find((location) => location.id === 'pine-airbnb')
-    const yosemite = doc.locations.find((location) => location.id === 'yosemite')
-    if (!basecamp?.coordinates || !yosemite?.coordinates) return
+    const locationsById = new Map(doc.locations.map((location) => [location.id, location]))
+    const routeLocationIds = (doc.routes || []).flatMap((route) => [
+      ...(route.stopLocationIds || []),
+      route.destinationLocationId,
+    ])
+    const itineraryLocationIds = [...doc.itineraryItems, ...doc.meals, ...doc.activities]
+      .map((item) => item.locationId)
+      .filter(Boolean)
+    const weatherLocationIds = [...new Set([...routeLocationIds, ...itineraryLocationIds])]
+    const weatherLocations = weatherLocationIds
+      .map((locationId) => locationsById.get(locationId))
+      .filter((location) => location?.coordinates)
+
+    if (!weatherLocations.length) {
+      setWeatherState({
+        status: 'idle',
+        targets: {},
+        updatedAt: null,
+        error: null,
+      })
+      return
+    }
 
     let cancelled = false
 
     const loadWeather = async () => {
       try {
-        const [basecampBundle, yosemiteBundle] = await Promise.all([
-          fetchWeatherBundle({ label: 'Groveland Basecamp', coordinates: basecamp.coordinates }),
-          fetchWeatherBundle({ label: 'Yosemite West Entrance', coordinates: yosemite.coordinates }),
-        ])
+        const bundles = await Promise.all(
+          weatherLocations.map((location) => fetchWeatherBundle({
+            label: location.title || location.id,
+            coordinates: location.coordinates,
+          })),
+        )
 
         if (cancelled) return
 
+        const targets = weatherLocations.reduce((acc, location, index) => {
+          const bundle = bundles[index]
+          if (!bundle) return acc
+          const dayIds = new Set()
+          doc.routes
+            .filter((route) => route.destinationLocationId === location.id || (route.stopLocationIds || []).includes(location.id))
+            .forEach((route) => dayIds.add(route.dayId || 'all'))
+          ;[...doc.itineraryItems, ...doc.meals, ...doc.activities]
+            .filter((item) => item.locationId === location.id)
+            .forEach((item) => dayIds.add(item.dayId || 'all'))
+
+          acc[location.id] = {
+            ...bundle,
+            dayIds: [...dayIds].filter((dayId) => dayId && dayId !== 'all'),
+          }
+          return acc
+        }, {})
+
         setWeatherState({
-          status: 'ready',
-          targets: {
-            basecamp: basecampBundle,
-            yosemite: yosemiteBundle,
-          },
+          status: Object.keys(targets).length ? 'ready' : 'idle',
+          targets,
           updatedAt: new Date().toISOString(),
           error: null,
         })
@@ -4526,7 +5466,7 @@ function App() {
       cancelled = true
       window.clearInterval(refreshId)
     }
-  }, [doc.locations, liveExternalData])
+  }, [doc.activities, doc.itineraryItems, doc.locations, doc.meals, doc.routes, liveExternalData])
 
   const updatePageNote = (pageId, value) => {
     setDoc((current) => ({
@@ -4568,15 +5508,135 @@ function App() {
     })
   }
 
+  const updateCollectionItem = useCallback((collectionName, id, patch) => {
+    setDoc((current) => {
+      const collection = current[collectionName]
+      if (!Array.isArray(collection)) return current
+      const nextCollection = collection.map((item) => (
+        item.id === id ? stampFamilyMetadata({ ...item, ...patch, id }, currentFamilyId) : item
+      ))
+      return {
+        ...current,
+        [collectionName]: nextCollection,
+        routes: collectionName === 'locations' || collectionName === 'routes'
+          ? synchronizeRoutePaths(
+              collectionName === 'routes' ? nextCollection : current.routes,
+              collectionName === 'locations' ? nextCollection : current.locations,
+            )
+          : current.routes,
+      }
+    })
+  }, [currentFamilyId, setDoc])
+
+  const removeCollectionItem = useCallback((collectionName, id, type) => {
+    setDoc((current) => {
+      const collection = current[collectionName]
+      if (!Array.isArray(collection)) return current
+      const nextCollection = collection.filter((item) => item.id !== id)
+      const nextDoc = {
+        ...current,
+        [collectionName]: nextCollection,
+      }
+      if (collectionName === 'locations' || collectionName === 'routes') {
+        nextDoc.routes = synchronizeRoutePaths(
+          collectionName === 'routes' ? nextCollection : current.routes,
+          collectionName === 'locations' ? nextCollection : current.locations,
+        )
+      }
+      if (current.selection?.type === type && current.selection?.id === id) {
+        nextDoc.selection = ensureSelectionForPage(nextDoc, nextDoc.selectedPage)
+      }
+      return nextDoc
+    })
+  }, [setDoc])
+
+  const addCollectionItem = useCallback((collectionName, type) => {
+    const id = `${type}-user-${Date.now()}`
+    const baseItem = stampFamilyMetadata(
+      {
+        id,
+        type,
+        title: `New ${type}`,
+        dayId: 'all',
+        note: '',
+      },
+      currentFamilyId,
+    )
+
+    setDoc((current) => {
+      const collection = current[collectionName]
+      if (!Array.isArray(collection)) return current
+      const nextDoc = {
+        ...current,
+        [collectionName]: [...collection, baseItem],
+        selection: { type, id },
+      }
+      return nextDoc
+    })
+  }, [currentFamilyId, setDoc])
+
   const toggleTask = (taskId) => {
     setDoc((current) => {
       const nextDoc = {
         ...current,
         tasks: current.tasks.map((task) =>
           task.id === taskId
-            ? { ...task, status: task.status === 'done' ? 'open' : 'done' }
+            ? {
+                ...task,
+                status: task.status === 'done' ? 'open' : 'done',
+                checklist: Array.isArray(task.checklist)
+                  ? task.checklist.map((item) => ({
+                      ...item,
+                      done: task.status !== 'done',
+                    }))
+                  : [],
+              }
             : task,
         ),
+      }
+      return withRefreshedFamilies(nextDoc)
+    })
+  }
+
+  const toggleTaskChecklistItem = (taskId, checklistItemId) => {
+    setDoc((current) => {
+      const nextDoc = {
+        ...current,
+        tasks: current.tasks.map((task) => {
+          if (task.id !== taskId) return task
+          const checklist = Array.isArray(task.checklist) ? task.checklist : []
+          const nextChecklist = checklist.map((item) =>
+            item.id === checklistItemId ? { ...item, done: !item.done } : item,
+          )
+          const done = nextChecklist.length > 0 && nextChecklist.every((item) => item.done)
+          return {
+            ...task,
+            checklist: nextChecklist,
+            status: done ? 'done' : 'open',
+          }
+        }),
+      }
+      return withRefreshedFamilies(nextDoc)
+    })
+  }
+
+  const addTaskChecklistItem = (taskId, label) => {
+    if (!label?.trim()) return
+    setDoc((current) => {
+      const nextDoc = {
+        ...current,
+        tasks: current.tasks.map((task) => {
+          if (task.id !== taskId) return task
+          const checklist = Array.isArray(task.checklist) ? task.checklist : []
+          return {
+            ...task,
+            checklist: [
+              ...checklist,
+              { id: `check-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, label: label.trim(), done: false },
+            ],
+            status: 'open',
+          }
+        }),
       }
       return withRefreshedFamilies(nextDoc)
     })
@@ -4593,6 +5653,7 @@ function App() {
         title,
         dayId: entity.dayId || 'all',
         status: 'open',
+        checklist: [],
         ownerFamilyId:
           entityType === 'family'
             ? entity.id
@@ -4866,7 +5927,17 @@ function App() {
   }
 
   let content = null
-  if (displayDoc.selectedPage === 'itinerary') {
+  if (displayDoc.selectedPage === 'ops') {
+    content = (
+      <OpsConfigPage
+        doc={displayDoc}
+        onSelectEntity={selectEntity}
+        onUpdateCollectionItem={updateCollectionItem}
+        onRemoveCollectionItem={removeCollectionItem}
+        onAddCollectionItem={addCollectionItem}
+      />
+    )
+  } else if (displayDoc.selectedPage === 'itinerary') {
     content = (
       <ItineraryPage
         {...pageProps}
@@ -4911,6 +5982,8 @@ function App() {
         onSelectEntity={selectEntity}
         onUpdateLocationFields={updateLocationFields}
         onToggleTask={toggleTask}
+        onToggleTaskChecklistItem={toggleTaskChecklistItem}
+        onAddTaskChecklistItem={addTaskChecklistItem}
         onUpdateEntityNote={updateEntityNote}
         onAddTask={addTask}
         onConvertNoteToTask={convertNoteToTask}
@@ -4931,6 +6004,14 @@ function App() {
       families={displayDoc.families}
       activeFamily={currentFamily}
       onSetActiveFamily={setActiveFamilyProfile}
+      operations={operations}
+      activeOperationId={activeOperationId}
+      onCreateOperation={createOperation}
+      onSelectOperation={selectOperation}
+      onDeleteOperation={deleteOperation}
+      onSaveOperationProfile={saveOperationProfile}
+      onSaveFamilyPlan={saveFamilyPlan}
+      shareableActivities={displayDoc.activities.filter((activity) => activity.shareable)}
     >
       {mainWithInspector}
     </AppShell>

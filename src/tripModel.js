@@ -24,7 +24,7 @@ export const ENTITY_PAGE = {
   task: 'itinerary',
 }
 
-const DEFAULT_SELECTION = { type: 'activity', id: 'thu-transit' }
+const DEFAULT_SELECTION = { type: 'family', id: '__none__' }
 export const TRIP_DOCUMENT_STORAGE_KEY = 'trip-command-center/v4-public'
 export const VIEWER_PROFILE_STORAGE_KEY = 'trip-command-center/viewer/v4-public'
 const LEGACY_TRIP_DOCUMENT_STORAGE_KEYS = ['trip-command-center/v3-public', 'trip-command-center/v2', 'trip-command-center/v1']
@@ -2094,22 +2094,35 @@ function buildRoutes() {
 
 export function createInitialTripDocument() {
   return {
-    selectedPage: 'itinerary',
+    selectedPage: 'ops',
     selection: DEFAULT_SELECTION,
+    operationProfile: {
+      title: '',
+      commandName: 'Family Trip Command Center',
+      destinationType: 'basecamp',
+      destinationLabel: '',
+      destinationAddress: '',
+      destinationNotes: '',
+      startDate: '',
+      endDate: '',
+      summary: '',
+      trafficMode: 'none',
+      configuredAt: null,
+    },
     pageNotes: {
-      itinerary: 'Mission priority: reduce Friday arrival chaos and make Saturday easy on the kids.',
-      stay: 'Need one clean arrival protocol so the first family is not doing all the setup work.',
-      meals: 'Thursday now uses an easy one-hour pizza dinner in Groveland, Friday is lunch out plus dinner at home, and Saturday uses a return-drive dinner stop instead of a deep park detour.',
-      activities: 'Yosemite is the headline day, but Friday should stay easy and Saturday should read as one clean outbound and one clean return.',
-      expenses: 'Keep this light. Shared visibility matters more than perfect accounting.',
-      families: 'Each family should know its task package before Thursday morning.',
+      itinerary: '',
+      stay: '',
+      meals: '',
+      activities: '',
+      expenses: '',
+      families: '',
     },
     pageNoteMeta: {},
     ui: {
       searchQuery: '',
       timeline: {
         mode: 'scenario',
-        cursorSlot: 3,
+        cursorSlot: 0,
       },
       map: {
         showRoutes: true,
@@ -2119,15 +2132,15 @@ export function createInitialTripDocument() {
         focusDayId: 'all',
       },
     },
-    families: buildFamilies(),
-    locations: buildLocations(),
-    routes: synchronizeRoutePaths(buildRoutes(), buildLocations()),
-    itineraryItems: buildItineraryItems(),
-    meals: buildMeals(),
-    activities: buildActivities(),
-    stayItems: buildStayItems(),
-    expenses: buildExpenses(),
-    tasks: buildTasks(),
+    families: [],
+    locations: [],
+    routes: [],
+    itineraryItems: [],
+    meals: [],
+    activities: [],
+    stayItems: [],
+    expenses: [],
+    tasks: [],
   }
 }
 
@@ -2701,7 +2714,14 @@ export function getTasksByFamily(doc, familyId) {
 export function getFamilyReadiness(doc, familyId) {
   const tasks = getTasksByFamily(doc, familyId)
   if (!tasks.length) return 100
-  const doneCount = tasks.filter((task) => task.status === 'done').length
+
+  const doneCount = tasks.filter((task) => {
+    if (Array.isArray(task.checklist) && task.checklist.length) {
+      return task.checklist.every((item) => item.done)
+    }
+    return task.status === 'done'
+  }).length
+
   return Math.round((doneCount / tasks.length) * 100)
 }
 
